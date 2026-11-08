@@ -211,7 +211,7 @@ footer { margin-top: 36px; color: var(--text-3); font-size: 12px; display: flex;
   .barra, .filtros { display: none; }
 }
 </style>
-<script>window.__API__ = 'https://script.google.com/macros/s/AKfycbxyx1tdtcMH8gAZ5dRu4EfVqqs6oHmgqNnJZvvvL_koQC5Iqlzd-MI0o1VuvouEyjkg/exec';</script>
+<script>window.__PUB__ = '10hJelf81QpnZungIwACF5iFikKbm5XTGtUuFnOxDiqs';</script>
 </head>
 <body>
 <div class="wrap">
@@ -285,18 +285,122 @@ footer { margin-top: 36px; color: var(--text-3); font-size: 12px; display: flex;
 
   /* ---------- estado ---------- */
   var estado = { dados: null, ciclo: null, plat: 'google', pag: '1', campanhaSeg: '__geral' };
-  var PARAMS = new URLSearchParams(location.search);
+  /* A chave fica depois do "#" no link: o navegador não a envia a nenhum servidor. */
+  var HASH = new URLSearchParams(location.hash.slice(1));
+
+  function gravarHash() {
+    var p = new URLSearchParams();
+    if (HASH.get('k')) p.set('k', HASH.get('k'));
+    if (HASH.get('c')) p.set('c', HASH.get('c'));
+    if (estado.ciclo) p.set('m', estado.ciclo);
+    try { history.replaceState(null, '', '#' + p.toString()); } catch (e) { /* ignora */ }
+  }
+
+  /* ---------- leitura dos dados criptografados ---------- */
+  var ENC = new TextEncoder();
+  function chaveHmac(raw) { return crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']); }
+  function hmac(key, data) { return crypto.subtle.sign('HMAC', key, data).then(function (b) { return new Uint8Array(b); }); }
+  function hex(bytes) { return Array.prototype.map.call(bytes, function (b) { return ('0' + b.toString(16)).slice(-2); }).join(''); }
+
+  function buscaDe(k) {
+    return chaveHmac(ENC.encode(k)).then(function (kb) { return hmac(kb, ENC.encode('id')); }).then(function (h) { return hex(h).slice(0, 24); });
+  }
+
+  function decifrar(k, b64) {
+    var all = Uint8Array.from(atob(b64), function (c) { return c.charCodeAt(0); });
+    var nonce = all.slice(0, 16), tag = all.slice(16, 48), ct = all.slice(48), kEnc, kMac;
+    return chaveHmac(ENC.encode(k)).then(function (kb) {
+      return Promise.all([hmac(kb, ENC.encode('enc')), hmac(kb, ENC.encode('mac'))]);
+    }).then(function (ks) {
+      return Promise.all([chaveHmac(ks[0]), chaveHmac(ks[1])]);
+    }).then(function (ks) {
+      kEnc = ks[0]; kMac = ks[1];
+      var macIn = new Uint8Array(16 + ct.length); macIn.set(nonce); macIn.set(ct, 16);
+      return hmac(kMac, macIn);
+    }).then(function (t2) {
+      for (var i = 0; i < 32; i++) if (t2[i] !== tag[i]) throw new Error('chave');
+      var blocos = [];
+      for (var b = 0; b < Math.ceil(ct.length / 32); b++) {
+        var m = new Uint8Array(20); m.set(nonce);
+        m[16] = b >>> 24 & 255; m[17] = b >>> 16 & 255; m[18] = b >>> 8 & 255; m[19] = b & 255;
+        blocos.push(hmac(kEnc, m));
+      }
+      return Promise.all(blocos);
+    }).then(function (ks) {
+      var pt = new Uint8Array(ct.length);
+      for (var i = 0; i < ct.length; i++) pt[i] = ct[i] ^ ks[i >> 5][i & 31];
+      return new TextDecoder().decode(pt);
+    });
+  }
+
+  /* Consulta a planilha publicada (só tem dados criptografados) via JSONP. */
+  function linhasDe(busca) {
+    return new Promise(function (ok, falha) {
+      var cb = '__gviz' + Math.random().toString(36).slice(2);
+      var s = document.createElement('script');
+      var tempo = setTimeout(function () { limpar(); falha(new Error('tempo')); }, 20000);
+      function limpar() { clearTimeout(tempo); try { delete window[cb]; } catch (e) { window[cb] = undefined; } s.remove(); }
+      window[cb] = function (resp) {
+        limpar();
+        if (!resp || resp.status !== 'ok') return falha(new Error('consulta'));
+        ok(resp.table.rows.map(function (r) { return { ciclo: r.c[0] && r.c[0].v, parte: Number(r.c[1] && r.c[1].v), dados: String(r.c[2] && r.c[2].v || '') }; }));
+      };
+      s.onerror = function () { limpar(); falha(new Error('rede')); };
+      s.src = 'https://docs.google.com/spreadsheets/d/' + window.__PUB__ + '/gviz/tq?tqx=responseHandler:' + cb +
+        '&sheet=dados&headers=1&tq=' + encodeURIComponent("select B, C, D where A = '" + busca + "'");
+      document.head.appendChild(s);
+    });
+  }
+
+  function agrupar(linhas) {
+    var g = {};
+    linhas.forEach(function (l) { (g[l.ciclo] = g[l.ciclo] || []).push(l); });
+    Object.keys(g).forEach(function (c) { g[c] = g[c].sort(function (a, b) { return a.parte - b.parte; }).map(function (l) { return l.dados; }).join(''); });
+    return g;
+  }
+
+  function mesesDe(k, grupos) {
+    var ciclos = Object.keys(grupos).filter(function (c) { return /^\d{4}-\d{2}$/.test(c); });
+    return Promise.all(ciclos.map(function (c) { return decifrar(k, grupos[c]).then(JSON.parse); })).then(function (lista) {
+      var dados = {};
+      ciclos.forEach(function (c, i) { dados[c] = lista[i]; });
+      return dados;
+    });
+  }
 
   /* ---------- carregamento ---------- */
   function iniciar() {
     if (window.__DASH__) return receber(window.__DASH__);
-    var api = window.__API__;
-    var c = PARAMS.get('c') || '', k = PARAMS.get('k') || '';
+    var k = HASH.get('k') || new URLSearchParams(location.search).get('k') || '';
     if (!k) return erro('Acesso restrito', 'Use o link que a Avanti enviou para você.');
-    fetch(api + '?formato=json&c=' + encodeURIComponent(c) + '&k=' + encodeURIComponent(k))
-      .then(function (r) { return r.json(); })
-      .then(receber)
-      .catch(function () { erro('Não foi possível carregar os dados', 'Verifique sua conexão e tente de novo em alguns minutos.'); });
+    if (!window.crypto || !crypto.subtle) return erro('Navegador sem suporte', 'Abra o link em um navegador atualizado (Chrome, Safari, Edge ou Firefox).');
+    if (!HASH.get('k')) HASH.set('k', k);
+    var payload = { ok: true, admin: false, clientes: null };
+    buscaDe(k).then(linhasDe).then(function (linhas) {
+      if (!linhas.length) throw new Error('chave');
+      var grupos = agrupar(linhas);
+      if (grupos.__clientes) {
+        return decifrar(k, grupos.__clientes).then(JSON.parse).then(function (lista) {
+          var alvo = lista.filter(function (c) { return c.id === HASH.get('c'); })[0] || lista[0];
+          if (!alvo) throw new Error('vazio');
+          payload.admin = true;
+          payload.clientes = lista.map(function (c) { return { id: c.id, nome: c.nome }; });
+          payload.cliente_id = alvo.id; payload.cliente = alvo.nome;
+          HASH.set('c', alvo.id);
+          return buscaDe(alvo.k).then(linhasDe).then(function (l2) { return mesesDe(alvo.k, agrupar(l2)); });
+        });
+      }
+      return mesesDe(k, grupos);
+    }).then(function (dados) {
+      payload.dados = dados;
+      payload.meses = Object.keys(dados).sort().reverse();
+      var primeiro = dados[payload.meses[0]] || {};
+      if (!payload.cliente) { payload.cliente = primeiro.cliente || 'Relatório'; payload.cliente_id = primeiro.cliente_id; }
+      receber(payload);
+    }).catch(function (e) {
+      if (e && /chave/.test(e.message)) erro('Link inválido', 'Confira se o link foi copiado inteiro ou peça um novo link à Avanti.');
+      else erro('Não foi possível carregar os dados', 'Verifique sua conexão e tente de novo em alguns minutos.');
+    });
   }
 
   function receber(d) {
@@ -305,7 +409,7 @@ footer { margin-top: 36px; color: var(--text-3); font-size: 12px; display: flex;
     $('cliente').textContent = d.cliente;
     document.title = 'Relatório de tráfego · ' + d.cliente;
     if (!d.meses || !d.meses.length) return erro('Ainda não há relatórios', 'O primeiro mês aparece aqui no 1º dia útil após o fechamento.');
-    var hashMes = (location.hash.match(/m=(\d{4}-\d{2})/) || [])[1];
+    var hashMes = HASH.get('m');
     estado.ciclo = d.meses.indexOf(hashMes) >= 0 ? hashMes : d.meses[0];
     var sel = $('sel-mes');
     sel.innerHTML = d.meses.map(function (m) { return '<option value="' + m + '">' + nomeMes(m) + '</option>'; }).join('');
@@ -333,14 +437,11 @@ footer { margin-top: 36px; color: var(--text-3); font-size: 12px; display: flex;
   }
 
   function trocarCliente(id) {
-    if (window.__DASH__ && window.google && google.script && google.script.url) {
-      google.script.url.getLocation(function (loc) {
-        window.top.location.href = window.__APP_URL__ + '?c=' + encodeURIComponent(id) + '&k=' + encodeURIComponent(loc.parameter.k || '');
-      });
-      return;
-    }
-    PARAMS.set('c', id);
-    location.search = PARAMS.toString();
+    HASH.set('c', id);
+    HASH.delete('m');
+    estado.ciclo = null;
+    gravarHash();
+    location.reload();
   }
 
   function erro(titulo, msg) {
@@ -366,7 +467,7 @@ footer { margin-top: 36px; color: var(--text-3); font-size: 12px; display: flex;
     });
     $('periodo').textContent = 'Período: 01 a ' + ultimoDia(estado.ciclo) + ' de ' + MESES[Number(estado.ciclo.slice(5, 7)) - 1] + ' de ' + estado.ciclo.slice(0, 4);
     $('gerado').textContent = mes.gerado_em ? 'Dados atualizados em ' + mes.gerado_em.slice(8, 10) + '/' + mes.gerado_em.slice(5, 7) + '/' + mes.gerado_em.slice(0, 4) : '';
-    try { history.replaceState(null, '', '#m=' + estado.ciclo); } catch (e) { /* iframe */ }
+    gravarHash();
 
     var d = estado.plat === 'google' ? g : m;
     var html;
