@@ -334,37 +334,62 @@ footer { margin-top: 36px; color: var(--text-3); font-size: 12px; display: flex;
   }
 
   /* Consulta a planilha publicada (só tem dados criptografados) via JSONP. */
-  function linhasDe(busca) {
+  function consulta(tq) {
     return new Promise(function (ok, falha) {
       var cb = '__gviz' + Math.random().toString(36).slice(2);
       var s = document.createElement('script');
-      var tempo = setTimeout(function () { limpar(); falha(new Error('tempo')); }, 20000);
+      var tempo = setTimeout(function () { limpar(); falha(new Error('tempo')); }, 30000);
       function limpar() { clearTimeout(tempo); try { delete window[cb]; } catch (e) { window[cb] = undefined; } s.remove(); }
       window[cb] = function (resp) {
         limpar();
         if (!resp || resp.status !== 'ok') return falha(new Error('consulta'));
-        ok(resp.table.rows.map(function (r) { return { ciclo: r.c[0] && r.c[0].v, parte: Number(r.c[1] && r.c[1].v), dados: String(r.c[2] && r.c[2].v || '') }; }));
+        ok(resp.table.rows.map(function (r) { return r.c.map(function (c) { return c ? c.v : null; }); }));
       };
       s.onerror = function () { limpar(); falha(new Error('rede')); };
       s.src = 'https://docs.google.com/spreadsheets/d/' + window.__PUB__ + '/gviz/tq?tqx=responseHandler:' + cb +
-        '&sheet=dados&headers=1&tq=' + encodeURIComponent("select B, C, D where A = '" + busca + "'");
+        '&sheet=dados&headers=1&tq=' + encodeURIComponent(tq);
       document.head.appendChild(s);
     });
   }
 
-  function agrupar(linhas) {
+  /* linhas no formato [ciclo, parte, dados] → { ciclo: texto completo } */
+  function juntar(linhas) {
     var g = {};
-    linhas.forEach(function (l) { (g[l.ciclo] = g[l.ciclo] || []).push(l); });
-    Object.keys(g).forEach(function (c) { g[c] = g[c].sort(function (a, b) { return a.parte - b.parte; }).map(function (l) { return l.dados; }).join(''); });
+    linhas.forEach(function (l) { (g[l[0]] = g[l[0]] || []).push(l); });
+    Object.keys(g).forEach(function (c) {
+      g[c] = g[c].sort(function (a, b) { return Number(a[1]) - Number(b[1]); }).map(function (l) { return String(l[2] || ''); }).join('');
+    });
     return g;
   }
 
-  function mesesDe(k, grupos) {
-    var ciclos = Object.keys(grupos).filter(function (c) { return /^\d{4}-\d{2}$/.test(c); });
-    return Promise.all(ciclos.map(function (c) { return decifrar(k, grupos[c]).then(JSON.parse); })).then(function (lista) {
-      var dados = {};
-      ciclos.forEach(function (c, i) { dados[c] = lista[i]; });
-      return dados;
+  var ACESSO = { k: '', busca: '' };
+  var IMGS = {};
+
+  /* Baixa e decifra um mês (dados + miniaturas) só quando ele for exibido. */
+  function garantirMes(ciclo) {
+    var d = estado.dados;
+    if (!d || d.dados[ciclo] || !ACESSO.busca) return Promise.resolve();
+    return consulta("select B, C, D where A = '" + ACESSO.busca + "' and (B = '" + ciclo + "' or B = '" + ciclo + "#img')").then(function (linhas) {
+      var g = juntar(linhas);
+      if (!g[ciclo]) throw new Error('mes');
+      var tarefas = [decifrar(ACESSO.k, g[ciclo]).then(JSON.parse).then(function (j) { d.dados[ciclo] = j; })];
+      if (g[ciclo + '#img']) {
+        tarefas.push(decifrar(ACESSO.k, g[ciclo + '#img']).then(JSON.parse).then(function (m) {
+          Object.keys(m).forEach(function (id) { IMGS[id] = m[id]; });
+        }).catch(function () { /* sem miniaturas embutidas: usa o link do Drive */ }));
+      }
+      return Promise.all(tarefas);
+    });
+  }
+
+  function mesesDaChave(chave) {
+    return buscaDe(chave).then(function (busca) {
+      ACESSO.k = chave; ACESSO.busca = busca;
+      return consulta("select B where A = '" + busca + "'");
+    }).then(function (linhas) {
+      var m = {};
+      linhas.forEach(function (l) { if (/^\d{4}-\d{2}$/.test(l[0])) m[l[0]] = true; });
+      return Object.keys(m).sort().reverse();
     });
   }
 
@@ -375,28 +400,30 @@ footer { margin-top: 36px; color: var(--text-3); font-size: 12px; display: flex;
     if (!k) return erro('Acesso restrito', 'Use o link que a Avanti enviou para você.');
     if (!window.crypto || !crypto.subtle) return erro('Navegador sem suporte', 'Abra o link em um navegador atualizado (Chrome, Safari, Edge ou Firefox).');
     if (!HASH.get('k')) HASH.set('k', k);
-    var payload = { ok: true, admin: false, clientes: null };
-    buscaDe(k).then(linhasDe).then(function (linhas) {
-      if (!linhas.length) throw new Error('chave');
-      var grupos = agrupar(linhas);
-      if (grupos.__clientes) {
-        return decifrar(k, grupos.__clientes).then(JSON.parse).then(function (lista) {
-          var alvo = lista.filter(function (c) { return c.id === HASH.get('c'); })[0] || lista[0];
-          if (!alvo) throw new Error('vazio');
-          payload.admin = true;
-          payload.clientes = lista.map(function (c) { return { id: c.id, nome: c.nome }; });
-          payload.cliente_id = alvo.id; payload.cliente = alvo.nome;
-          HASH.set('c', alvo.id);
-          return buscaDe(alvo.k).then(linhasDe).then(function (l2) { return mesesDe(alvo.k, agrupar(l2)); });
-        });
-      }
-      return mesesDe(k, grupos);
-    }).then(function (dados) {
-      payload.dados = dados;
-      payload.meses = Object.keys(dados).sort().reverse();
-      var primeiro = dados[payload.meses[0]] || {};
-      if (!payload.cliente) { payload.cliente = primeiro.cliente || 'Relatório'; payload.cliente_id = primeiro.cliente_id; }
-      receber(payload);
+    var payload = { ok: true, admin: false, clientes: null, dados: {}, meses: [] };
+    buscaDe(k).then(function (busca) {
+      return consulta("select B, C, D where A = '" + busca + "' and B = '__clientes'");
+    }).then(function (linhas) {
+      if (!linhas.length) return mesesDaChave(k);
+      return decifrar(k, juntar(linhas).__clientes).then(JSON.parse).then(function (lista) {
+        var alvo = lista.filter(function (c) { return c.id === HASH.get('c'); })[0] || lista[0];
+        if (!alvo) throw new Error('vazio');
+        payload.admin = true;
+        payload.clientes = lista.map(function (c) { return { id: c.id, nome: c.nome }; });
+        payload.cliente_id = alvo.id; payload.cliente = alvo.nome;
+        HASH.set('c', alvo.id);
+        return mesesDaChave(alvo.k);
+      });
+    }).then(function (meses) {
+      if (!meses.length) throw new Error('chave');
+      payload.meses = meses;
+      estado.dados = payload;
+      var inicial = meses.indexOf(HASH.get('m')) >= 0 ? HASH.get('m') : meses[0];
+      return garantirMes(inicial).then(function () {
+        var j = payload.dados[inicial] || {};
+        if (!payload.cliente) { payload.cliente = j.cliente || 'Relatório'; payload.cliente_id = j.cliente_id; }
+        receber(payload);
+      });
     }).catch(function (e) {
       if (e && /chave/.test(e.message)) erro('Link inválido', 'Confira se o link foi copiado inteiro ou peça um novo link à Avanti.');
       else erro('Não foi possível carregar os dados', 'Verifique sua conexão e tente de novo em alguns minutos.');
@@ -414,7 +441,12 @@ footer { margin-top: 36px; color: var(--text-3); font-size: 12px; display: flex;
     var sel = $('sel-mes');
     sel.innerHTML = d.meses.map(function (m) { return '<option value="' + m + '">' + nomeMes(m) + '</option>'; }).join('');
     sel.value = estado.ciclo;
-    sel.onchange = function () { estado.ciclo = sel.value; estado.campanhaSeg = '__geral'; desenhar(); };
+    sel.onchange = function () {
+      var c = sel.value;
+      $('conteudo').innerHTML = '<div class="estado"><p>Carregando ' + nomeMes(c).toLowerCase() + '…</p></div>';
+      garantirMes(c).then(function () { estado.ciclo = c; estado.campanhaSeg = '__geral'; desenhar(); })
+        .catch(function () { erro('Não foi possível carregar o mês', 'Tente de novo em alguns minutos.'); });
+    };
     if (d.admin && d.clientes) {
       $('lbl-cliente').hidden = false;
       var sc = $('sel-cliente');
@@ -599,7 +631,11 @@ footer { margin-top: 36px; color: var(--text-3); font-size: 12px; display: flex;
   }
 
   function imgUrl(a) {
-    if (a.imagem_id) return { src: 'https://lh3.googleusercontent.com/d/' + a.imagem_id + '=w600', alt: 'https://drive.google.com/thumbnail?id=' + a.imagem_id + '&sz=w600' };
+    if (a.imagem_id) {
+      var lh3 = 'https://lh3.googleusercontent.com/d/' + a.imagem_id + '=w600';
+      if (IMGS[a.imagem_id]) return { src: IMGS[a.imagem_id], alt: lh3 };
+      return { src: lh3, alt: 'https://drive.google.com/thumbnail?id=' + a.imagem_id + '&sz=w600' };
+    }
     if (a.imagem) return { src: a.imagem, alt: '' };
     return null;
   }
